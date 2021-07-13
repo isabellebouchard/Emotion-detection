@@ -1,145 +1,109 @@
 import numpy as np
 import argparse
-import matplotlib.pyplot as plt
 import cv2
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, Dropout, Flatten
 from tensorflow.keras.layers import Conv2D
-from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.layers import MaxPooling2D
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
 import os
+import imageio
+from pathlib import Path
+import time
+
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
-# command line argument
-ap = argparse.ArgumentParser()
-ap.add_argument("--mode",help="train/display")
-mode = ap.parse_args().mode
+VIDEO_FILENAME = Path("videos") / "Les moments forts du dernier débat des chefs_360P.mp4"
+MODEL_FILENAME = "model.h5"
+CASCADE_FILENAME = "haarcascade_frontalface_default.xml"
 
-# plots accuracy and loss curves
-def plot_model_history(model_history):
-    """
-    Plot Accuracy and Loss curves given the model_history
-    """
-    fig, axs = plt.subplots(1,2,figsize=(15,5))
-    # summarize history for accuracy
-    axs[0].plot(range(1,len(model_history.history['accuracy'])+1),model_history.history['accuracy'])
-    axs[0].plot(range(1,len(model_history.history['val_accuracy'])+1),model_history.history['val_accuracy'])
-    axs[0].set_title('Model Accuracy')
-    axs[0].set_ylabel('Accuracy')
-    axs[0].set_xlabel('Epoch')
-    axs[0].set_xticks(np.arange(1,len(model_history.history['accuracy'])+1),len(model_history.history['accuracy'])/10)
-    axs[0].legend(['train', 'val'], loc='best')
-    # summarize history for loss
-    axs[1].plot(range(1,len(model_history.history['loss'])+1),model_history.history['loss'])
-    axs[1].plot(range(1,len(model_history.history['val_loss'])+1),model_history.history['val_loss'])
-    axs[1].set_title('Model Loss')
-    axs[1].set_ylabel('Loss')
-    axs[1].set_xlabel('Epoch')
-    axs[1].set_xticks(np.arange(1,len(model_history.history['loss'])+1),len(model_history.history['loss'])/10)
-    axs[1].legend(['train', 'val'], loc='best')
-    fig.savefig('plot.png')
-    plt.show()
+# dictionary which assigns each label an emotion (alphabetical order)
+EMOTIONS = {
+    0: "Angry",
+    1: "Disgusted",
+    2: "Fearful",
+    3: "Happy",
+    4: "Neutral",
+    5: "Sad",
+    6: "Surprised"
+}
 
-# Define data generators
-train_dir = 'data/train'
-val_dir = 'data/test'
+def load_model(model_filename):
+    # Create the model
+    model = Sequential()
 
-num_train = 28709
-num_val = 7178
-batch_size = 64
-num_epoch = 50
+    model.add(Conv2D(32, kernel_size=(3, 3), activation='relu', input_shape=(48,48,1)))
+    model.add(Conv2D(64, kernel_size=(3, 3), activation='relu'))
+    model.add(MaxPooling2D(pool_size=(2, 2)))
+    model.add(Dropout(0.25))
 
-train_datagen = ImageDataGenerator(rescale=1./255)
-val_datagen = ImageDataGenerator(rescale=1./255)
+    model.add(Conv2D(128, kernel_size=(3, 3), activation='relu'))
+    model.add(MaxPooling2D(pool_size=(2, 2)))
+    model.add(Conv2D(128, kernel_size=(3, 3), activation='relu'))
+    model.add(MaxPooling2D(pool_size=(2, 2)))
+    model.add(Dropout(0.25))
 
-train_generator = train_datagen.flow_from_directory(
-        train_dir,
-        target_size=(48,48),
-        batch_size=batch_size,
-        color_mode="grayscale",
-        class_mode='categorical')
+    model.add(Flatten())
+    model.add(Dense(1024, activation='relu'))
+    model.add(Dropout(0.5))
+    model.add(Dense(7, activation='softmax'))
 
-validation_generator = val_datagen.flow_from_directory(
-        val_dir,
-        target_size=(48,48),
-        batch_size=batch_size,
-        color_mode="grayscale",
-        class_mode='categorical')
+    model.load_weights(model_filename)
 
-# Create the model
-model = Sequential()
+    return model
 
-model.add(Conv2D(32, kernel_size=(3, 3), activation='relu', input_shape=(48,48,1)))
-model.add(Conv2D(64, kernel_size=(3, 3), activation='relu'))
-model.add(MaxPooling2D(pool_size=(2, 2)))
-model.add(Dropout(0.25))
 
-model.add(Conv2D(128, kernel_size=(3, 3), activation='relu'))
-model.add(MaxPooling2D(pool_size=(2, 2)))
-model.add(Conv2D(128, kernel_size=(3, 3), activation='relu'))
-model.add(MaxPooling2D(pool_size=(2, 2)))
-model.add(Dropout(0.25))
+def apply_model(model, facecasc, frame):
+    # Find haar cascade to draw bounding box around face
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = facecasc.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
 
-model.add(Flatten())
-model.add(Dense(1024, activation='relu'))
-model.add(Dropout(0.5))
-model.add(Dense(7, activation='softmax'))
+    for (x, y, w, h) in faces:
+        face = cv2.resize(gray[y: y + h, x: x + w], (48, 48))
 
-# If you want to train the same model or try other models, go for this
-if mode == "train":
-    model.compile(loss='categorical_crossentropy',optimizer=Adam(lr=0.0001, decay=1e-6),metrics=['accuracy'])
-    model_info = model.fit_generator(
-            train_generator,
-            steps_per_epoch=num_train // batch_size,
-            epochs=num_epoch,
-            validation_data=validation_generator,
-            validation_steps=num_val // batch_size)
-    plot_model_history(model_info)
-    model.save_weights('model.h5')
+        # Filter out false positives (faces in bg + tie)
+        if face.mean() < 40 or y + h > 200:
+            continue
 
-# emotions will be displayed on your face from the webcam feed
-elif mode == "display":
-    model.load_weights('model.h5')
+        # Resize face crop images 48x48
+        cropped_img = np.expand_dims(np.expand_dims(face, -1), 0)
 
-    # prevents openCL usage and unnecessary logging messages
-    cv2.ocl.setUseOpenCL(False)
+        # Draw rectangle around the face
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
 
-    # dictionary which assigns each label an emotion (alphabetical order)
-    emotion_dict = {0: "Angry", 1: "Disgusted", 2: "Fearful", 3: "Happy", 4: "Neutral", 5: "Sad", 6: "Surprised"}
+        # Call the model
+        prediction = model.predict(cropped_img).tolist()[0]
 
-    # start the webcam feed
-    cap = cv2.VideoCapture(0)
-    while True:
-        # Find haar cascade to draw bounding box around face
-        ret, frame = cap.read()
-        if not ret:
-            break
-        facecasc = cv2.CascadeClassifier('haarcascade_frontalface_default.xml')
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = facecasc.detectMultiScale(gray,scaleFactor=1.3, minNeighbors=5)
+        # Format text and colors
+        for i, pred in enumerate(prediction):
+            pos = (x , y + h + 10 * i)
+            color = (0, 0, 255) if pred > 0.2 else (255, 255, 255)
 
-        for (x, y, w, h) in faces:
-            cv2.rectangle(frame, (x, y-50), (x+w, y+h+10), (255, 0, 0), 2)
-            roi_gray = gray[y:y + h, x:x + w]
-            cropped_img = np.expand_dims(np.expand_dims(cv2.resize(roi_gray, (48, 48)), -1), 0)
-            prediction = model.predict(cropped_img).tolist()[0]
+            text = EMOTIONS[i]
+            text += ": "
+            text += "{:.4f}".format(pred)
 
-            for i, pred in enumerate(prediction):
-                pos = (x , y - 60 - 15 * i)
+            cv2.putText(frame, text, pos, cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
-                if pred > 0.2:
-                    color = (0, 255, 255)
-                else:
-                    color = (255, 255, 255)
-                text = emotion_dict[i]
-                text += ": "
-                text += "{:.2f}".format(pred)
-                cv2.putText(frame, text, pos, cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    cv2.imshow('Video', cv2.resize(frame,(1600,960),interpolation = cv2.INTER_CUBIC))
 
-        cv2.imshow('Video', cv2.resize(frame,(1600,960),interpolation = cv2.INTER_CUBIC))
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+    time.sleep(0.15)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        return
 
-    cap.release()
+
+def run():
+    model = load_model(MODEL_FILENAME)
+    facecasc = cv2.CascadeClassifier(CASCADE_FILENAME)
+
+    video_reader = imageio.get_reader(VIDEO_FILENAME,  'ffmpeg')
+    for i, frame in enumerate(video_reader):
+        if i % 5 != 0:
+            continue
+        apply_model(model, facecasc, frame)
+
     cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    run()
